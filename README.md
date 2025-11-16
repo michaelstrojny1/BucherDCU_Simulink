@@ -2,7 +2,7 @@
 
 The **Bucher DCU** is a PMSM Vector Control Inverter. This repository contains a simulation of the inverter and a PDF describing the mathematical models used. Please see **Datasheet.pdf** for the Bucher DCU datasheet. You should read **Bucher_DCU_Math_And_Theory.pdf** start to finish to understand the math behind the simulation and what each simulation parameter does.
 
-We implement the DCU as a Matlab Function Block. All parameters are doubles. The load torque, torque command and speed command are double time series (2xN matrix) and hv_ok is a boolean double. Units are: seconds, amps, volts, ohms, henries, farads, rad/s, Nm and kgm^2. Please copy the DCU Implementation (excluding the demonstration runner at the top) within the Bucher_DCU_MLX_Demo.mlx file into a Matlab Function block in your Simulink Simulation. You can use the demonstration runner within Bucher_DCU_MLX_Demo.mlx to play around with the DCU and potentially debug it if you choose to modify the script.
+We implement the DCU as a Matlab Function Block. All parameters are doubles. The load torque, torque command and speed command are double time series (2xN matrix) and hv_ok is a boolean double. Units are: seconds, amps, volts, ohms, henries, farads, rad/s, Nm and kgm^2. Please copy the DCU Implementation (excluding the demonstration runner at the top) within the **Bucher_DCU_MLX_Demo.mlx** file into a Matlab Function block in your Simulink Simulation. You can use the demonstration runner within Bucher_DCU_MLX_Demo.mlx to play around with the DCU and potentially debug it if you choose to modify the simulation dynamics.
 
 **Quick Background On Vector Control PMSM Inverters**
 
