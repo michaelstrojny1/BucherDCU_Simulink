@@ -1,349 +1,341 @@
-function [vd, vq, M, status, sat_mode] = DCU_Controller( ...
-    mode, speed_ref, TorqueCmd, ...
-    theta_mech, omega_mech, vdc_meas, id_meas, iq_meas, ...
-    P, M, status)
+function [vd, vq, M, status, sat_mode] = DCU_Controller(mode, speed_ref, TorqueCmd, theta_mech, omega_mech, vdc_meas, id_meas, iq_meas, P, M, status)
 
-    Ts = P.Ts;
+% outputs vd vq + memory M
 
-    if isempty(M)
-        M = init_mem();
-    end
-    if isempty(status)
-        status = default_status();
-    end
+Ts = P.Ts;                     % sample time
 
-    if ~isfield(M,'pi_d')
-        M.pi_d   = pi_create(P.Kp_d, P.Ki_d, Ts, -Inf, Inf);
-        M.pi_q   = pi_create(P.Kp_q, P.Ki_q, Ts, -Inf, Inf);
-        M.pi_w   = pi_create(P.Kp_w, P.Ki_w, Ts, -P.Imax, P.Imax);
+if isempty(M)                  % init
+    M = init_mem();            % make memory
+end
 
-        % regen PI: use Vp_vdc as Kp and Tn_vdc as Ti → Ki = Kp/Ti
-        Ki_reg   = P.Vp_vdc / max(P.Tn_vdc, Ts);
-        M.pi_reg = pi_create(P.Vp_vdc, Ki_reg, Ts, -P.Imax, 0);
-    end
+if isempty(status)
+    status = default_status(); 
+end
 
-    % resolver
-    pp = max(P.pole_pairs_ratio, eps);
-    theta_e_raw = pp * theta_mech;
-    omega_e_raw = pp * omega_mech;
-    a = min(max(P.alpha_res,0),1);
+% make PI contro9llers
+if ~isfield(M,'pi_d')          
+    M.pi_d   = pi_create(P.Kp_d,   P.Ki_d,   Ts, -Inf, Inf);
+    M.pi_q   = pi_create(P.Kp_q,   P.Ki_q,   Ts, -Inf, Inf);
+    M.pi_w   = pi_create(P.Kp_w,   P.Ki_w,   Ts, -P.Imax, P.Imax);
+    Ki_reg   = P.Vp_vdc / max(P.Tn_vdc, Ts);
+    M.pi_reg = pi_create(P.Vp_vdc, Ki_reg,  Ts, -P.Imax, 0);
+end
 
-    if a > 0
-        dtheta = wrapToPi(theta_e_raw - M.theta_filt);
-        M.theta_filt = wrapToPi(M.theta_filt + a*dtheta);
-        M.omega_filt = (1-a)*M.omega_filt + a*omega_e_raw;
+% angle filter for observer
+pp = max(P.pole_pairs_ratio, eps);      
+theta_e_raw = pp * theta_mech;          % angle
+omega_e_raw = pp * omega_mech;          % angular speed
+a = min(max(P.alpha_res,0),1);          % filter strength 0..1
+if a > 0
+    dtheta = wrapToPi(theta_e_raw - M.theta_filt);
+    M.theta_filt = wrapToPi(M.theta_filt + a*dtheta);
+    M.omega_filt = (1-a)*M.omega_filt + a*omega_e_raw;
+else
+    M.theta_filt = theta_e_raw;
+    M.omega_filt = omega_e_raw;
+end
+
+% observer
+diq_dt = lpf_diff(iq_meas, Ts, 1e-3, 'q');     % filtered diq/dt
+M.prev_vq = default0(M,'prev_vq');             % last vq
+den_q = max(abs(P.Ld*id_meas + P.psi_f), 1e-6);
+omega_hat = (M.prev_vq - P.Rs*iq_meas - P.Lq*diq_dt) / den_q;
+beta = min(1.0, Ts/0.002);
+M.omega_e_hat = (1-beta)*M.omega_e_hat + beta*omega_hat;
+M.theta_hat = wrapToPi(M.theta_hat + Ts*M.omega_e_hat);
+
+if P.mode_inner == 5
+    theta_e = M.theta_hat;      % use observer
+    omega_e = M.omega_e_hat;
+else
+    theta_e = M.theta_filt;     % use filtered resolver
+    omega_e = M.omega_filt;
+end
+omega_mech_est = omega_e / max(pp,eps);    % back to mech speed
+
+% soft (gradual) inverter start  enable
+enabled = (P.hv_ok ~= 0);
+if enabled && ~M.prev_enabled
+    M.ss = 0;                   % start inverter slowly
+    M.pi_d = pi_reset(M.pi_d);
+    M.pi_q = pi_reset(M.pi_q);
+    M.pi_w = pi_reset(M.pi_w);
+    M.pi_reg = pi_reset(M.pi_reg);
+end
+M.prev_enabled = enabled;
+
+% smooth speed cmd
+spd_raw = min(max(speed_ref, -P.w_max), P.w_max);
+ds = spd_raw - M.spd_prev;
+if ds > P.acc_max*Ts, spd_raw = M.spd_prev + P.acc_max*Ts; end
+if ds < -P.dec_max*Ts, spd_raw = M.spd_prev - P.dec_max*Ts; end
+M.spd_prev = spd_raw;
+alpha_ref = min(1.0, Ts/max(0.03,Ts));
+M.spd_cmd = M.spd_cmd + alpha_ref*(spd_raw - M.spd_cmd);
+
+% torque limit
+Tmax_I = 1.5*P.p*P.psi_f*P.Imax;
+Tmax_allowed_mot = min(Tmax_I, P.T_fac*P.T_rated);
+Tmax_allowed_reg = min(Tmax_I, P.T_fac*P.T_rated);
+Tmax_allowed_reg = min(Tmax_allowed_reg, P.Tmax_reg);
+tq_raw = TorqueCmd;
+if tq_raw >= 0
+    tq_raw = min(tq_raw, Tmax_allowed_mot);
+else
+    tq_raw = max(tq_raw, -Tmax_allowed_reg);
+end
+M.tq_cmd = M.tq_cmd + alpha_ref*(tq_raw - M.tq_cmd);
+
+% mode changing
+
+if ~isfield(M,'prev_mode')
+    M.prev_mode = mode;
+end
+if M.prev_mode ~= mode
+    if mode == 2
+        e_w = M.spd_cmd - omega_mech_est;
+        [~, M.pi_w] = pi_step(M.pi_w, e_w);
+        M.spd_cmd = omega_mech_est;
+        M.spd_prev = omega_mech_est;
     else
-        M.theta_filt = theta_e_raw;
-        M.omega_filt = omega_e_raw;
-    end
-
-    % observer (dq back-EMF, filtered di/dt)
-    diq_dt = lpf_diff(iq_meas, Ts, 1e-3, 'q');
-    M.prev_vq = default0(M,'prev_vq');
-    den_q = max(abs(P.Ld*id_meas + P.psi_f), 1e-6);
-    omega_hat = (M.prev_vq - P.Rs*iq_meas - P.Lq*diq_dt) / den_q;
-    beta = min(1.0, Ts/0.002);
-    M.omega_e_hat = (1-beta)*M.omega_e_hat + beta*omega_hat;
-    M.theta_hat   = wrapToPi(M.theta_hat + Ts*M.omega_e_hat);
-
-    if P.mode_inner == 5
-        theta_e = M.theta_hat;
-        omega_e = M.omega_e_hat;
-    else
-        theta_e = M.theta_filt;
-        omega_e = M.omega_filt;
-    end
-
-    omega_mech_est = omega_e / max(pp,eps);
-
-    % enable / soft start
-    enabled = (P.hv_ok ~= 0);
-    if enabled && ~M.prev_enabled
-        M.ss = 0;
-        M.pi_d   = pi_reset(M.pi_d);
-        M.pi_q   = pi_reset(M.pi_q);
-        M.pi_w   = pi_reset(M.pi_w);
+        M.pi_w = pi_reset(M.pi_w);
         M.pi_reg = pi_reset(M.pi_reg);
     end
-    M.prev_enabled = enabled;
+    M.prev_mode = mode;
+    M.mode_sw_timer = 0.05;         % short freeze after switch
+end
 
-    % speed ref shaping
-    spd_raw = min(max(speed_ref, -P.w_max), P.w_max);
-    ds = spd_raw - M.spd_prev;
-    if ds >  P.acc_max*Ts, spd_raw = M.spd_prev + P.acc_max*Ts; end
-    if ds <  P.dec_max*Ts, spd_raw = M.spd_prev + P.dec_max*Ts; end
-    M.spd_prev = spd_raw;
+% speed torque and regen loops
+e_w = M.spd_cmd - omega_mech_est;
 
-    alpha_ref = min(1.0, Ts/max(0.03,Ts));
-    M.spd_cmd = M.spd_cmd + alpha_ref*(spd_raw - M.spd_cmd);
+if mode == 2                        % speed mode
+    [iq_vel, M.pi_w] = pi_step(M.pi_w, e_w);
+    iq_vel = sat(iq_vel, -P.Imax, P.Imax);
+else
+    iq_vel = 0;
+end
 
-    % torque limit from allowed params only
-    Tmax_I = 1.5*P.p*P.psi_f*P.Imax;
-    Tmax_allowed_mot = min(Tmax_I, P.T_fac*P.T_rated);
-    Tmax_allowed_reg = min(Tmax_I, P.T_fac*P.T_rated);
-    Tmax_allowed_reg = min(Tmax_allowed_reg, P.Tmax_reg);
+iq_trq = (2*M.tq_cmd) / max(3*P.p*P.psi_f, eps);   % torque  iq
 
-    tq_raw = TorqueCmd;
-    if tq_raw >= 0
-        tq_raw = min(tq_raw, Tmax_allowed_mot);
+if mode == -5 && abs(omega_mech_est) > P.omega_regen_min
+    e_reg = 0 - omega_mech_est;
+    [iq_pi, M.pi_reg] = pi_step(M.pi_reg, e_reg);
+    iq_pi = sat(iq_pi, -P.Imax, 0);
+    if vdc_meas > P.Vdc_max             % overvoltage
+        iq_pi = 0;
+    end
+    iq_reg = iq_pi;
+else
+    iq_reg = 0;
+    M.pi_reg = pi_reset(M.pi_reg);
+end
+
+% iq reference pick depending on mode
+if mode == 2
+    iq_des_raw = iq_vel;
+elseif mode == 4
+    iq_des_raw = iq_trq;
+elseif mode == -5
+    iq_des_raw = iq_reg;
+else
+    iq_des_raw = 0;
+end
+
+% iq limit
+diq = iq_des_raw - M.iq_cmd_prev;
+lim_iq = P.diq_slew * Ts;
+iq_des = M.iq_cmd_prev + sat(diq, -lim_iq, lim_iq);
+M.iq_cmd_prev = iq_des;
+iq_ref = sat(iq_des, -P.Imax, P.Imax);
+
+% Field weakening
+vmax = 0.577 * max(vdc_meas,1e-6) * P.vfac;
+Ki_fw = (P.FW_Ti>0) * (Ts / max(P.FW_Ti, Ts));
+
+if M.mode_sw_timer > 0
+    M.mode_sw_timer = max(0, M.mode_sw_timer - Ts);
+end
+fw_allowed = (M.mode_sw_timer == 0) && (abs(omega_mech_est) >= 50);
+
+omega_e_ctl = P.p * omega_mech_est;
+vd_need = P.Rs*id_meas - omega_e_ctl*P.Lq*iq_ref;
+vq_need = P.Rs*iq_ref + omega_e_ctl*(P.Ld*id_meas + P.psi_f);
+mag_pred = hypot(vd_need, vq_need);
+
+if ~fw_allowed
+    id_cmd = 0;
+    M.int_fw = 0;
+elseif mag_pred > P.FW_on*vmax
+    e_fw = mag_pred - P.FW_on*vmax;
+    M.int_fw = M.int_fw + Ki_fw*e_fw;
+    id_cmd = -P.FW_Kp*e_fw - M.int_fw;
+elseif mag_pred < P.FW_off*vmax
+    M.int_fw = 0.95 * M.int_fw;
+    id_cmd = -M.int_fw;
+else
+    e_fw = mag_pred - vmax;
+    M.int_fw = M.int_fw + 0.5*Ki_fw*e_fw;
+    id_cmd = -P.FW_Kp*e_fw - M.int_fw;
+end
+
+id_limit = P.id_fac * P.Imax;
+id_cmd = sat(id_cmd, -id_limit, 0);
+
+% id limits
+did_allowed = P.did_slew * Ts;
+id_ref = sat(id_cmd, id_meas - did_allowed, id_meas + did_allowed);
+id_ref = sat(id_ref, -id_limit, 0);
+
+% current PI
+ed = id_ref - id_meas;
+[vd_pi, M.pi_d] = pi_step(M.pi_d, ed);
+vd_uns = vd_pi - P.decouple_k * (omega_e_ctl * P.Lq * iq_meas);
+
+eq = iq_ref - iq_meas;
+[vq_pi, M.pi_q] = pi_step(M.pi_q, eq);
+vq_uns = vq_pi + P.decouple_k * (omega_e_ctl * (P.Ld*id_meas + P.psi_f));
+
+% voltage limits and anti windup
+vmax_now = vmax;
+mag = hypot(vd_uns, vq_uns);
+if mag > vmax_now
+    fw_active = (id_cmd < -1e-6) || (abs(M.int_fw) > 1e-6);
+    if fw_active && (vd_uns < 0)          % keep negative vd in FW
+        vd = max(vd_uns, -vmax_now);
+        vq = sign(vq_uns) * sqrt(max(vmax_now^2 - vd^2, 0));
     else
-        tq_raw = max(tq_raw, -Tmax_allowed_reg);
+        sc = vmax_now / mag;
+        vd = vd_uns * sc;
+        vq = vq_uns * sc;
     end
-    M.tq_cmd = M.tq_cmd + alpha_ref*(tq_raw - M.tq_cmd);
-
-    % mode switch smoothing
-    if ~isfield(M,'prev_mode')
-        M.prev_mode = mode;
-    end
-    if M.prev_mode ~= mode
-        if mode == 2
-            e_w = M.spd_cmd - omega_mech_est;
-            [~, M.pi_w] = pi_step(M.pi_w, e_w);
-            M.spd_cmd  = omega_mech_est;
-            M.spd_prev = omega_mech_est;
-        else
-            M.pi_w   = pi_reset(M.pi_w);
-            M.pi_reg = pi_reset(M.pi_reg);
-        end
-        M.prev_mode = mode;
-        M.mode_sw_timer = 0.05;
-    end
-
-    % outer loops
-    e_w = M.spd_cmd - omega_mech_est;
-
-    % speed → iq_ref (mode 2)
-    if mode == 2
-        [iq_vel, M.pi_w] = pi_step(M.pi_w, e_w);
-        iq_vel = sat(iq_vel, -P.Imax, P.Imax);
-    else
-        iq_vel = 0;
-    end
-
-    % torque mode iq_ref
-    iq_trq = (2*M.tq_cmd) / max(3*P.p*P.psi_f, eps);
-
-    % regen mode iq_ref: PI on speed to 0, with Vdc protection
-    if mode == -5 && abs(omega_mech_est) > P.omega_regen_min
-        e_reg = 0 - omega_mech_est;
-        [iq_pi, M.pi_reg] = pi_step(M.pi_reg, e_reg);
-        iq_pi = sat(iq_pi, -P.Imax, 0);
-
-        % simple DC-link protection: cut regen if above Vdc_max
-        if vdc_meas > P.Vdc_max
-            iq_pi = 0;
-        end
-
-        iq_reg = iq_pi;
-        iq_reg = sat(iq_reg, -P.Imax, 0);
-    else
-        iq_reg = 0;
-        M.pi_reg = pi_reset(M.pi_reg);
-    end
-
-    % select iq_des_raw by mode
-    if mode == 2
-        iq_des_raw = iq_vel;
-    elseif mode == 4
-        iq_des_raw = iq_trq;
-    elseif mode == -5
-        iq_des_raw = iq_reg;
-    else
-        iq_des_raw = 0;
-    end
-
-    % iq slew + clamp
-    diq = iq_des_raw - M.iq_cmd_prev;
-    lim_iq = P.diq_slew * Ts;
-    iq_des = M.iq_cmd_prev + sat(diq, -lim_iq, lim_iq);
-    M.iq_cmd_prev = iq_des;
-    iq_ref = sat(iq_des, -P.Imax, P.Imax);
-
-    % field weakening
-    vmax = 0.577 * max(vdc_meas,1e-6) * P.vfac;
-    Ki_fw = (P.FW_Ti>0) * (Ts / max(P.FW_Ti, Ts));
-
-    if M.mode_sw_timer > 0
-        M.mode_sw_timer = max(0, M.mode_sw_timer - Ts);
-    end
-
-    fw_allowed = (M.mode_sw_timer == 0) && (abs(omega_mech_est) >= 50);
-    omega_e_ctl = P.p * omega_mech_est;
-
-    vd_need = P.Rs*id_meas - omega_e_ctl*P.Lq*iq_ref;
-    vq_need = P.Rs*iq_ref + omega_e_ctl*(P.Ld*id_meas + P.psi_f);
-    mag_pred = hypot(vd_need, vq_need);
-
-    if ~fw_allowed
-        id_cmd = 0;
-        M.int_fw = 0;
-    elseif mag_pred > P.FW_on*vmax
-        e_fw = mag_pred - P.FW_on*vmax;
-        M.int_fw = M.int_fw + Ki_fw*e_fw;
-        id_cmd = -P.FW_Kp*e_fw - M.int_fw;
-    elseif mag_pred < P.FW_off*vmax
-        M.int_fw = 0.95 * M.int_fw;
-        id_cmd = -M.int_fw;
-    else
-        e_fw = mag_pred - vmax;
-        M.int_fw = M.int_fw + 0.5*Ki_fw*e_fw;
-        id_cmd = -P.FW_Kp*e_fw - M.int_fw;
-    end
-
-    id_limit = P.id_fac * P.Imax;
-    id_cmd = sat(id_cmd, -id_limit, 0);
-
-    % id slew
-    did_allowed = P.did_slew * Ts;
-    id_ref = sat(id_cmd, id_meas - did_allowed, id_meas + did_allowed);
-    id_ref = sat(id_ref, -id_limit, 0);
-
-    % current controllers with decoupling
-    ed = id_ref - id_meas;
-    [vd_pi, M.pi_d] = pi_step(M.pi_d, ed);
-    vd_uns = vd_pi - P.decouple_k * (omega_e_ctl * P.Lq * iq_meas);
-
-    eq = iq_ref - iq_meas;
-    [vq_pi, M.pi_q] = pi_step(M.pi_q, eq);
-    vq_uns = vq_pi + P.decouple_k * (omega_e_ctl * (P.Ld*id_meas + P.psi_f));
-
-    % voltage saturation
-    vmax_now = vmax;
-    mag = hypot(vd_uns, vq_uns);
-    if mag > vmax_now
-        fw_active = (id_cmd < -1e-6) || (abs(M.int_fw) > 1e-6);
-        if fw_active && (vd_uns < 0)
-            vd = max(vd_uns, -vmax_now);
-            vq = sign(vq_uns) * sqrt(max(vmax_now^2 - vd^2, 0));
-        else
-            sc = vmax_now / mag;
-            vd = vd_uns * sc;
-            vq = vq_uns * sc;
-        end
-        M.pi_d = pi_aw(M.pi_d, vd, vd_uns);
-        M.pi_q = pi_aw(M.pi_q, vq, vq_uns);
-        sat_mode = 1;
-    else
-        vd = vd_uns;
-        vq = vq_uns;
-        sat_mode = 0;
-    end
-
-    % dv/dt limiter
-    [vd, M.prev_vd] = slew(vd, default0(M,'prev_vd'), P.dv_max, Ts);
-    [vq, M.prev_vq] = slew(vq, default0(M,'prev_vq'), P.dv_max, Ts);
-
-    % soft start / gating
-    if enabled
-        M.ss = min(1.0, M.ss + Ts/max(0.02,Ts));
-    else
-        M.ss = 0;
-    end
-    vd = M.ss * vd;
-    vq = M.ss * vq;
-
-    if ~enabled
-        vd = 0;
-        vq = 0;
-    end
-
-    status.enabled      = enabled;
-    status.FW_active    = (id_cmd < 0) || (abs(M.int_fw) > 1e-6);
-    status.regen_active = (mode == -5) && (abs(omega_mech_est) > P.omega_regen_min);
+    M.pi_d = pi_aw(M.pi_d, vd, vd_uns);    % anti windup
+    M.pi_q = pi_aw(M.pi_q, vq, vq_uns);
+    sat_mode = 1;
+else
+    vd = vd_uns;
+    vq = vq_uns;
+    sat_mode = 0;
 end
 
-function M = init_mem()
-    M.int_fw        = 0;
-    M.theta_filt    = 0;
-    M.omega_filt    = 0;
-    M.theta_hat     = 0;
-    M.omega_e_hat   = 0;
-    M.prev_vd       = 0;
-    M.prev_vq       = 0;
-    M.prev_enabled  = false;
-    M.ss            = 0;
-    M.spd_prev      = 0;
-    M.spd_cmd       = 0;
-    M.tq_cmd        = 0;
-    M.iq_cmd_prev   = 0;
-    M.prev_mode     = 0;
-    M.mode_sw_timer = 0;
+% dv/dt limits
+[vd, M.prev_vd] = slew(vd, default0(M,'prev_vd'), P.dv_max, Ts);
+[vq, M.prev_vq] = slew(vq, default0(M,'prev_vq'), P.dv_max, Ts);
+
+% soft start (start inverter gradually) if enabled
+if enabled
+    M.ss = min(1.0, M.ss + Ts/max(0.02,Ts));
+else
+    M.ss = 0;
+end
+vd = M.ss * vd;
+vq = M.ss * vq;
+
+if ~enabled
+    vd = 0;
+    vq = 0;
 end
 
-function s = default_status()
-    s = struct('enabled',false,'regen_active',false,'FW_active',false);
+% states(flags)
+
+status.enabled = enabled;
+status.FW_active = (id_cmd < 0) || (abs(M.int_fw) > 1e-6);
+status.regen_active = (mode == -5) && (abs(omega_mech_est) > P.omega_regen_min);
+
 end
 
-function [y, yprev] = slew(y, yprev, rate, Ts)
-    lim = rate * Ts;
-    dy = y - yprev;
-    if dy > lim
-        y = yprev + lim;
-    elseif dy < -lim
-        y = yprev - lim;
-    end
-    yprev = y;
+### HELPERS
+
+function M = init_mem()           % init mem
+M.int_fw = 0;
+M.theta_filt = 0;
+M.omega_filt = 0;
+M.theta_hat = 0;
+M.omega_e_hat = 0;
+M.prev_vd = 0;
+M.prev_vq = 0;
+M.prev_enabled = false;
+M.ss = 0;
+M.spd_prev = 0;
+M.spd_cmd = 0;
+M.tq_cmd = 0;
+M.iq_cmd_prev = 0;
+M.prev_mode = 0;
+M.mode_sw_timer = 0;
 end
 
-function ang = wrapToPi(ang)
-    ang = mod(ang + pi, 2*pi) - pi;
+function s = default_status()      % default state
+s = struct('enabled',false,'regen_active',false,'FW_active',false);
 end
 
-function v = sat(v, vmin, vmax)
-    v = min(max(v, vmin), vmax);
+function [y,yprev] = slew(y,yprev,rate,Ts)   % rate limit
+lim = rate * Ts;
+dy = y - yprev;
+if dy > lim
+    y = yprev + lim;
+elseif dy < -lim
+    y = yprev - lim;
+end
+yprev = y;
 end
 
-function out = default0(M, field)
-    if isfield(M, field)
-        out = M.(field);
-    else
-        out = 0;
-    end
+function ang = wrapToPi(ang)       % -pi to pi
+ang = mod(ang + pi, 2*pi) - pi;
 end
 
-function dx = lpf_diff(x, Ts, tau, tag)
-    persistent x_prev_q x_prev_d y_prev_q y_prev_d
-    if isempty(x_prev_q), x_prev_q = 0; y_prev_q = 0; end
-    if isempty(x_prev_d), x_prev_d = 0; y_prev_d = 0; end
-
-    alpha = Ts / max(tau, Ts);
-    if tag == 'q'
-        raw = (x - x_prev_q) / max(Ts,1e-9);
-        y   = (1-alpha)*y_prev_q + alpha*raw;
-        dx  = y;
-        x_prev_q = x;
-        y_prev_q = y;
-    else
-        raw = (x - x_prev_d) / max(Ts,1e-9);
-        y   = (1-alpha)*y_prev_d + alpha*raw;
-        dx  = y;
-        x_prev_d = x;
-        y_prev_d = y;
-    end
+function v = sat(v,vmin,vmax)      % clamp
+v = min(max(v, vmin), vmax);
 end
 
-function PI = pi_create(Kp, Ki, Ts, umin, umax)
-    PI.Kp   = Kp;
-    PI.Ki   = Ki;
-    PI.Ts   = Ts;
-    PI.umin = umin;
-    PI.umax = umax;
-    PI.Kb   = 1.0;
-    PI.x    = 0;
+function out = default0(M,field)   % safe zero
+if isfield(M, field)
+    out = M.(field);
+else
+    out = 0;
+end
 end
 
-function [u, PI] = pi_step(PI, e)
-    up   = PI.Kp * e;
-    ui   = PI.x + PI.Ki * PI.Ts * e;
-    u_uns = up + ui;
-    u    = sat(u_uns, PI.umin, PI.umax);
-    PI.x = ui + PI.Kb * (u - u_uns);
+function dx = lpf_diff(x,Ts,tau,tag)   % derivative + filter
+persistent x_prev_q x_prev_d y_prev_q y_prev_d
+if isempty(x_prev_q), x_prev_q=0; y_prev_q=0; end
+if isempty(x_prev_d), x_prev_d=0; y_prev_d=0; end
+alpha = Ts / max(tau, Ts);
+if tag == 'q'
+    raw = (x - x_prev_q) / max(Ts,1e-9);
+    y = (1-alpha)*y_prev_q + alpha*raw;
+    dx = y;
+    x_prev_q = x;
+    y_prev_q = y;
+else
+    raw = (x - x_prev_d) / max(Ts,1e-9);
+    y = (1-alpha)*y_prev_d + alpha*raw;
+    dx = y;
+    x_prev_d = x;
+    y_prev_d = y;
+end
 end
 
-function PI = pi_reset(PI)
-    PI.x = 0;
+function PI = pi_create(Kp,Ki,Ts,umin,umax)   % make PI
+PI.Kp = Kp;
+PI.Ki = Ki;
+PI.Ts = Ts;
+PI.umin = umin;
+PI.umax = umax;
+PI.Kb = 1.0;
+PI.x = 0;
 end
 
-function PI = pi_aw(PI, u_sat, u_uns)
-    PI.x = PI.x + PI.Kb * (u_sat - u_uns);
+function [u,PI] = pi_step(PI,e)       %  PI step
+up = PI.Kp * e;
+ui = PI.x + PI.Ki * PI.Ts * e;
+u_uns = up + ui;
+u = sat(u_uns, PI.umin, PI.umax);
+PI.x = ui + PI.Kb * (u - u_uns);
+end
+
+function PI = pi_reset(PI)           % clear integrator
+PI.x = 0;
+end
+
+function PI = pi_aw(PI,u_sat,u_uns)     % anti windup
+PI.x = PI.x + PI.Kb * (u_sat - u_uns);
 end
